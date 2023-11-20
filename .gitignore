@@ -8,3 +8,9 @@ run.bash
 
 *.pyc
 **/__pycache__
+
+data_kuaiyi/
+kuaiyi*/
+toolllama/
+toolllama_lora/
+*.log

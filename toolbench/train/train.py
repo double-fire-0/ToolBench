@@ -28,7 +28,8 @@ from transformers.trainer_pt_utils import LabelSmoother
 from toolbench.tool_conversation import SeparatorStyle
 from toolbench.model.model_adapter import get_conversation_template
 from toolbench.train.llama_condense_monkey_patch import replace_llama_with_condense
-
+import logging
+from typing import Union, List
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 torch.set_printoptions(profile="full")
@@ -40,7 +41,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(
+    data_path: Union[str, List[str]] = field(
         default=None, metadata={"help": "Path to the training data."}
     )
     eval_data_path: str = field(
@@ -50,6 +51,7 @@ class DataArguments:
         default=None, metadata={"help": "Template used to format the training data."}
     )
     lazy_preprocess: bool = False
+    shuffle_train_data: bool = False
     
 
 @dataclass
@@ -153,7 +155,7 @@ def preprocess(
             rank0_print(tokenizer.decode(z))
 
         if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
+            if cur_len != total_len: # TODO 
                 target[:] = IGNORE_TOKEN_ID
                 rank0_print(
                     f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
@@ -218,6 +220,8 @@ class LazySupervisedDataset(Dataset):
             attention_mask=ret["attention_mask"][0],
         )
         self.cached_data_dict[i] = ret
+        # import pdb
+        # pdb.set_trace()
 
         return ret
 
@@ -229,8 +233,13 @@ def make_supervised_data_module(
     dataset_cls = (
         LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
     )
-    rank0_print("Loading data...")
-    raw_data = json.load(open(data_args.data_path, "r"))
+    data_paths = list(data_args.data_path)
+    raw_data = []
+    for data_path in data_paths:
+        add_data = json.load(open(data_path, "r"))
+        raw_data += add_data
+        rank0_print(f"Loading {len(add_data)} samples from {data_path}")
+    # raw_data = json.load(open(data_args.data_path, "r"))
     if data_args.eval_data_path is not None:
         train_raw_data = raw_data
         eval_raw_data = json.load(open(data_args.eval_data_path, "r"))
@@ -242,6 +251,11 @@ def make_supervised_data_module(
         eval_indices = perm[split:]
         train_raw_data = [raw_data[i] for i in train_indices]
         eval_raw_data = [raw_data[i] for i in eval_indices]
+    if data_args.shuffle_train_data:
+        import random
+        random.seed(10)
+        random.shuffle(train_raw_data)
+        rank0_print(f"#train data has been shuffled!")
     rank0_print(f"#train {len(train_raw_data)}, #eval {len(eval_raw_data)}")
     train_dataset = dataset_cls(train_raw_data, tokenizer=tokenizer, template=data_args.conv_template)
     eval_dataset = dataset_cls(eval_raw_data, tokenizer=tokenizer, template=data_args.conv_template)
@@ -271,7 +285,8 @@ def train():
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
+    #ddp = world_size != 1
+    ddp = True
     device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)} if ddp else None
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -279,16 +294,37 @@ def train():
         device_map=device_map
     )
     model.config.use_cache = False
-    trainer = Trainer(
-        model=model, tokenizer=tokenizer, args=training_args, **data_module
-    )
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    if training_args.do_train:
+        trainer = Trainer(
+            model=model, tokenizer=tokenizer, args=training_args, **data_module
+        )
+        if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+            trainer.train(resume_from_checkpoint=True)
+        else:
+            trainer.train()
+        trainer.save_state()
+        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+
+    if training_args.do_predict:
+        output_prediction_file = open(os.path.join(training_args.output_dir, f"generated_predictions_{training_args.local_rank}.txt"),'w')
+        for data in data_module['eval_dataset']:
+            try:
+                iids, label, mask = data['input_ids'], data['labels'], data['attention_mask']
+                seq_len = sum(mask)
+                iids = iids[:seq_len]
+                label = label[:seq_len]
+                iids = torch.masked_select(iids, torch.where(label == -100, True, False))
+                out = model.generate(input_ids=torch.tensor(iids.unsqueeze(0), device=device_map[""]), max_new_tokens=100)
+                out_text = tokenizer.decode(out[0])
+                label = torch.masked_select(label, torch.where(label != -100, True, False))
+                out_label = tokenizer.decode(label)
+                output_prediction_file.write(f'\n-----pred-----\n{out_text}\n-----label-----\n{out_label}')
+            except:
+                logging.exception("message")
+        output_prediction_file.close()
+
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ from toolbench.train.llama_flash_attn_monkey_patch import (
 )
 from toolbench.train.llama_condense_monkey_patch import replace_llama_with_condense
 replace_llama_attn_with_flash_attn()
+import torch
+import logging
 
 
 @dataclass
@@ -105,7 +107,8 @@ def train():
         replace_llama_with_condense(ratio=condense_ratio)
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
+    # ddp = world_size != 1
+    ddp = True
     device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)} if ddp else None
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -143,24 +146,51 @@ def train():
     tokenizer.pad_token = tokenizer.unk_token
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = Trainer(
-        model=model, tokenizer=tokenizer, args=training_args, **data_module
-    )
 
-    model.config.use_cache = False
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    # from ipdb import set_trace
+    # set_trace()
+
+    if True: #TODO: add arg
+        model.config.use_cache = False
+        model.load_adapter(training_args.output_dir,adapter_name='default')
+        output_prediction_file = open(os.path.join(training_args.output_dir, f"generated_predictions_{training_args.local_rank}.txt"),'w')
+        for data in data_module['eval_dataset']:
+            try:
+                iids, label, mask = data['input_ids'], data['labels'], data['attention_mask']
+                seq_len = sum(mask)
+                iids = iids[:seq_len]
+                label = label[:seq_len]
+                iids = torch.masked_select(iids, torch.where(label == -100, True, False))
+                out = model.generate(input_ids = iids.unsqueeze(0).to(device_map[""]), max_new_tokens=100)
+                out_text = tokenizer.decode(out[0])
+                label = torch.masked_select(label, torch.where(label != -100, True, False))
+                out_label = tokenizer.decode(label)
+                output_prediction_file.write(f'\n-----pred-----\n{out_text}\n-----label-----\n{out_label}')
+            except:
+                logging.exception("message")
+        output_prediction_file.close()
     else:
-        trainer.train()
-    trainer.save_state()
+        trainer = Trainer(
+            model=model, tokenizer=tokenizer, args=training_args, **data_module
+        )
 
-    # Save states. Weights might be a placeholder in zero3 and need a gather
-    state_dict = get_peft_state_maybe_zero_3(
-        model.named_parameters(), lora_args.lora_bias
-    )
-    if training_args.local_rank == 0:
-        model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+        model.config.use_cache = False
+
+        if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+            trainer.train(resume_from_checkpoint=True)
+        else:
+            trainer.train()
+        trainer.save_state()
+
+        # Save states. Weights might be a placeholder in zero3 and need a gather
+        state_dict = get_peft_state_maybe_zero_3(
+            model.named_parameters(), lora_args.lora_bias
+        )
+        if training_args.local_rank == 0:
+            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+
+
 
 
 if __name__ == "__main__":
